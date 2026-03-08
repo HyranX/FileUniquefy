@@ -2,7 +2,7 @@
 微信文件夹去重工具
 
 扫描指定目录下所有形如 YYYY-MM 的子文件夹，分析每个文件夹内的重复文件，
-将重复文件移动到上层目录的「重复/YYYY-MM/」文件夹中，保留最新修改的文件。
+将重复文件移动到上层目录的「重复/YYYY-MM/」文件夹中，保留最早修改的文件（原始文件）。
 """
 
 import glob
@@ -28,18 +28,84 @@ WECHAT_PATTERNS_NEW = os.path.join("xwechat_files", "*", "msg", "file")
 WECHAT_PATTERNS_OLD = os.path.join("WeChat Files", "*", "FileStorage", "File")
 
 
+def _display_width(s):
+    """计算字符串在终端中的显示宽度（中文字符占2列）。"""
+    width = 0
+    for c in s:
+        cp = ord(c)
+        if (0x1100 <= cp <= 0x115F or 0x2E80 <= cp <= 0x303E or
+                0x3040 <= cp <= 0xA4CF or 0xAC00 <= cp <= 0xD7AF or
+                0xF900 <= cp <= 0xFAFF or 0xFE10 <= cp <= 0xFE1F or
+                0xFE30 <= cp <= 0xFE6F or 0xFF01 <= cp <= 0xFF60 or
+                0xFFE0 <= cp <= 0xFFE6):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _ljust(s, width):
+    """按显示宽度左对齐填充空格。"""
+    return s + " " * max(0, width - _display_width(s))
+
+
+def _rjust(s, width):
+    """按显示宽度右对齐填充空格。"""
+    return " " * max(0, width - _display_width(s)) + s
+
+
+def _fmt_size(size_bytes):
+    """将字节数格式化为可读字符串。"""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} PB"
+
+
+def _count_dir(path):
+    """递归统计目录下的文件总数和总大小（字节）。"""
+    total_files = 0
+    total_size = 0
+    try:
+        for root, _, files in os.walk(path):
+            for f in files:
+                total_files += 1
+                try:
+                    total_size += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except PermissionError:
+        pass
+    return total_files, total_size
+
+
+def _extract_wechat_meta(path):
+    """从路径中提取微信版本和用户ID。返回 (version, user_id)。"""
+    norm = path.replace("\\", "/")
+    # 新版: .../xwechat_files/<user_id>/msg/file
+    m = re.search(r"xwechat_files/([^/]+)/msg/file", norm, re.IGNORECASE)
+    if m:
+        return "新版微信", m.group(1)
+    # 旧版: .../WeChat Files/<user_id>/FileStorage/File
+    m = re.search(r"WeChat Files/([^/]+)/FileStorage/File", norm, re.IGNORECASE)
+    if m:
+        return "旧版微信", m.group(1)
+    return "未知", "未知"
+
+
 def find_wechat_dirs():
-    """自动扫描系统中可能的微信文件目录。"""
+    """自动扫描系统中可能的微信文件目录。
+    返回列表，每个元素为 dict: {path, version, user_id, month_count}
+    """
     candidates = set()
 
     if platform.system() == "Windows":
-        # 扫描所有盘符下的常见位置
         for letter in string.ascii_uppercase:
             drive = f"{letter}:\\"
             if not os.path.exists(drive):
                 continue
             search_roots = [drive]
-            # 扫描该盘符下所有用户的 Documents 目录
             users_dir = os.path.join(drive, "Users")
             if os.path.isdir(users_dir):
                 try:
@@ -52,50 +118,54 @@ def find_wechat_dirs():
                                 search_roots.append(docs)
                 except PermissionError:
                     pass
-            # 也扫描盘符根目录（用户可能把 Documents 放在 D:\ 等）
             for root in search_roots:
                 for pattern in [WECHAT_PATTERNS_NEW, WECHAT_PATTERNS_OLD]:
                     for path in glob.glob(os.path.join(root, pattern)):
                         if os.path.isdir(path):
-                            candidates.add(os.path.normpath(path))
-                    # 也搜索 root/document/ 等变体
+                            candidates.add(os.path.realpath(path))
                     for doc_name in ["document", "Document", "documents", "Documents"]:
                         doc_path = os.path.join(root, doc_name)
                         if os.path.isdir(doc_path):
                             for path in glob.glob(os.path.join(doc_path, pattern)):
                                 if os.path.isdir(path):
-                                    candidates.add(os.path.normpath(path))
+                                    candidates.add(os.path.realpath(path))
     else:
-        # macOS / Linux
         home = os.path.expanduser("~")
         search_roots = [home]
-        # 常见 Documents 位置
         for doc_name in ["Documents", "documents", "文档"]:
             doc_path = os.path.join(home, doc_name)
             if os.path.isdir(doc_path):
                 search_roots.append(doc_path)
-        # macOS 微信还可能在 ~/Library/Containers/ 下
         containers = os.path.join(home, "Library", "Containers")
         if os.path.isdir(containers):
             search_roots.append(containers)
-
         for root in search_roots:
             for pattern in [WECHAT_PATTERNS_NEW, WECHAT_PATTERNS_OLD]:
                 for path in glob.glob(os.path.join(root, pattern)):
                     if os.path.isdir(path):
-                        candidates.add(os.path.normpath(path))
+                        candidates.add(os.path.realpath(path))
 
-    # 过滤：只保留包含 YYYY-MM 子文件夹的目录
+    # 过滤：只保留含 YYYY-MM 子文件夹的目录，并附加元数据
     valid = []
     month_pattern = re.compile(r"^\d{4}-\d{2}$")
     for d in sorted(candidates):
         try:
-            has_month = any(
-                month_pattern.match(e) and os.path.isdir(os.path.join(d, e))
-                for e in os.listdir(d)
-            )
-            if has_month:
-                valid.append(d)
+            month_dirs = [
+                e for e in os.listdir(d)
+                if month_pattern.match(e) and os.path.isdir(os.path.join(d, e))
+            ]
+            if not month_dirs:
+                continue
+            version, user_id = _extract_wechat_meta(d)
+            total_files, total_size = _count_dir(d)
+            valid.append({
+                "path": d,
+                "version": version,
+                "user_id": user_id,
+                "month_count": len(month_dirs),
+                "total_files": total_files,
+                "total_size": total_size,
+            })
         except PermissionError:
             pass
 
@@ -213,8 +283,13 @@ def scan_month_dir(month_dir, use_md5=True):
         if len(files) <= 1:
             continue
 
-        # 按修改时间降序排列，保留最新的
-        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        # 排序优先级：1) 无 (N) 后缀的原始文件优先保留；2) 修改时间升序作为次级排序
+        def _sort_key(fp):
+            stem = os.path.splitext(os.path.basename(fp))[0]
+            has_dup_suffix = 1 if re.search(r'\(\d+\)$', stem) else 0
+            return (has_dup_suffix, os.path.getmtime(fp))
+
+        files.sort(key=_sort_key)
         latest_file = files[0]
 
         for dup_file in files[1:]:
@@ -247,7 +322,7 @@ def execute_move_plan(move_plan):
         move(dup_file, dest_path)
 
 
-def print_move_plan(month_name, move_plan):
+def print_move_plan(month_name, move_plan, base_directory):
     """打印单个月份的移动计划。"""
     if not move_plan:
         print(f"  {month_name}: 无重复文件")
@@ -260,9 +335,10 @@ def print_move_plan(month_name, move_plan):
         groups.setdefault(keep, []).append((dup, dest))
 
     for keep, dups in groups.items():
-        print(f"    [保留] {os.path.basename(keep)}")
+        print(f"    [保留] {month_name}/{os.path.basename(keep)}")
         for dup, dest in dups:
-            print(f"    [移动] {os.path.basename(dup)} -> {dest}")
+            rel_dest = os.path.relpath(dest, base_directory)
+            print(f"    [移动] {month_name}/{os.path.basename(dup)} -> {rel_dest}")
 
 
 def select_directory():
@@ -280,13 +356,21 @@ def select_directory():
     wechat_dirs = find_wechat_dirs()
 
     if wechat_dirs:
-        print(f"找到 {len(wechat_dirs)} 个微信文件目录:\n")
+        # 计算各列宽度
+        uid_width = max(len(d["user_id"]) for d in wechat_dirs)
+        uid_width = max(uid_width, 6)  # 最小宽度"用户ID"
+
+        print(f"  找到 {len(wechat_dirs)} 个微信文件目录:\n")
+        ver_w = max(_display_width(d["version"]) for d in wechat_dirs)
+        size_w = max(len(_fmt_size(d["total_size"])) for d in wechat_dirs)
+        size_w = max(size_w, 8)
+        print(f"  {'编号':>4}  {_ljust('版本', ver_w)}  {_ljust('用户ID', uid_width)}  {'月份数':>6}  {'文件数':>6}  {'总大小':>{size_w}}  路径")
+        print(f"  {'----':>4}  {'-'*ver_w}  {'-'*uid_width}  {'------':>6}  {'------':>6}  {'-'*size_w}  ----")
         for i, d in enumerate(wechat_dirs, 1):
-            # 统计 YYYY-MM 子文件夹数量
-            month_count = len(find_month_dirs(d))
-            print(f"  [{i}] {d}")
-            print(f"      ({month_count} 个月份文件夹)")
-        print(f"\n  [0] 手动输入其他路径")
+            size_str = _fmt_size(d["total_size"])
+            print(f"  [{i:>2}]  {_ljust(d['version'], ver_w)}  {_ljust(d['user_id'], uid_width)}  {d['month_count']:>6}  {d['total_files']:>6}  {size_str:>{size_w}}  {d['path']}")
+
+        print(f"\n  [ 0]  手动输入其他路径")
         print()
 
         while True:
@@ -296,7 +380,7 @@ def select_directory():
             try:
                 idx = int(choice)
                 if 1 <= idx <= len(wechat_dirs):
-                    return wechat_dirs[idx - 1]
+                    return wechat_dirs[idx - 1]["path"]
             except ValueError:
                 pass
             print(f"无效输入，请输入 0-{len(wechat_dirs)} 之间的数字。")
@@ -313,13 +397,13 @@ def select_directory():
 
 
 def quick_scan_summary(month_dirs):
-    """统计每个月份文件夹的文件数、大小疑似重复数和 MD5 精确重复数。"""
-    summary = []  # (month_dir, total_files, size_dups, md5_dups)
+    """统计每个月份文件夹的文件数和 MD5 精确重复数。"""
+    summary = []  # (month_dir, total_files, md5_dups)
     for month_dir in month_dirs:
         files = list(find_files(month_dir))
         total = len(files)
 
-        # 按文件大小分组
+        # 先按文件大小分组，只对同大小文件计算 MD5（减少 IO）
         size_map = {}
         for f in files:
             try:
@@ -328,9 +412,6 @@ def quick_scan_summary(month_dirs):
             except OSError:
                 pass
 
-        size_dups = sum(len(g) - 1 for g in size_map.values() if len(g) > 1)
-
-        # 对大小相同的文件进行 MD5 精确比对
         md5_map = {}
         for group in size_map.values():
             if len(group) <= 1:
@@ -344,54 +425,48 @@ def quick_scan_summary(month_dirs):
 
         md5_dups = sum(len(g) - 1 for g in md5_map.values() if len(g) > 1)
 
-        summary.append((month_dir, total, size_dups, md5_dups))
+        summary.append((month_dir, total, md5_dups))
     return summary
 
 
-def main():
-    base_directory = select_directory()
-
-    # 安全检查
-    validate_directory(base_directory)
-
-    # 是否使用 MD5（推荐，更准确但较慢）
+def process_directory(base_directory):
+    """处理一个微信文件目录的完整流程，返回 True 表示希望返回主界面。"""
     use_md5 = True
 
     month_dirs = find_month_dirs(base_directory)
     if not month_dirs:
         print(f"未找到形如 YYYY-MM 的子文件夹: {base_directory}")
-        sys.exit(0)
+        return True
 
     # ===== 第一阶段：概览（含 MD5 精确重复数）=====
     print(f"\n找到 {len(month_dirs)} 个月份文件夹，正在分析重复情况...\n")
     summary = quick_scan_summary(month_dirs)
 
     has_dup = False
-    print(f"  {'月份':<12} {'文件数':>6} {'大小疑似':>8} {'MD5重复':>8}")
-    print(f"  {'-'*12} {'-'*6} {'-'*8} {'-'*8}")
-    for month_dir, total, size_dups, md5_dups in summary:
+    c0, c1, c2 = 12, 6, 8
+    print(f"  {_ljust('月份', c0)} {_rjust('文件数', c1)} {_rjust('MD5重复', c2)}")
+    print(f"  {'-'*c0} {'-'*c1} {'-'*c2}")
+    for month_dir, total, md5_dups in summary:
         month_name = os.path.basename(month_dir)
-        size_label = str(size_dups) if size_dups > 0 else "-"
-        md5_label  = str(md5_dups)  if md5_dups  > 0 else "-"
-        print(f"  {month_name:<12} {total:>6} {size_label:>8} {md5_label:>8}")
+        md5_label  = str(md5_dups) if md5_dups > 0 else "-"
+        print(f"  {_ljust(month_name, c0)} {total:>{c1}} {md5_label:>{c2}}")
         if md5_dups > 0:
             has_dup = True
 
     total_files   = sum(s[1] for s in summary)
-    total_size_dup = sum(s[2] for s in summary)
-    total_md5_dup  = sum(s[3] for s in summary)
-    print(f"  {'-'*12} {'-'*6} {'-'*8} {'-'*8}")
-    print(f"  {'合计':<12} {total_files:>6} {total_size_dup:>8} {total_md5_dup:>8}")
+    total_md5_dup = sum(s[2] for s in summary)
+    print(f"  {'-'*c0} {'-'*c1} {'-'*c2}")
+    print(f"  {_ljust('合计', c0)} {total_files:>{c1}} {total_md5_dup:>{c2}}")
     print()
 
     if not has_dup:
         print("所有文件夹中均无 MD5 重复文件，无需操作。")
-        sys.exit(0)
+        return True
 
     confirm = input("是否生成详细移动计划？(y/n): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("已取消。")
-        sys.exit(0)
+        return True
 
     # ===== 第二阶段：生成移动计划 =====
     print("\n正在生成移动计划...\n")
@@ -410,7 +485,7 @@ def main():
 
     if total_dup_count == 0:
         print("经 MD5 精确比对，无重复文件，无需操作。")
-        sys.exit(0)
+        return True
 
     # ===== 汇报移动计划 =====
     print("=" * 60)
@@ -421,10 +496,10 @@ def main():
 
     for month_dir, plan in all_plans.items():
         month_name = os.path.basename(month_dir)
-        print_move_plan(month_name, plan)
+        print_move_plan(month_name, plan, base_directory)
     print()
 
-    # ===== 第三阶段：用户确认并执行 =====
+    # ===== 第三阶段：用户确认 =====
     if total_dup_count > WARN_FILE_COUNT:
         print(f"⚠ 注意: 待移动文件数量较大 ({total_dup_count} 个)，请仔细核实目录是否正确！")
         print(f"  操作目录: {base_directory}\n")
@@ -432,7 +507,7 @@ def main():
     confirm = input("是否执行以上移动操作？(y/n): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("已取消操作，未移动任何文件。")
-        sys.exit(0)
+        return True
 
     # ===== 第四阶段：执行移动 =====
     print("\n正在移动文件...")
@@ -446,6 +521,32 @@ def main():
         total_moved += len(plan)
 
     print(f"\n完成! 共移动 {total_moved} 个重复文件到「重复」文件夹。")
+    return True
+
+
+def main():
+    # 命令行参数模式：直接处理，不循环
+    if len(sys.argv) > 1:
+        path = os.path.abspath(sys.argv[1])
+        if not os.path.isdir(path):
+            print(f"错误: 目录不存在 - {path}")
+            sys.exit(1)
+        validate_directory(path)
+        process_directory(path)
+        return
+
+    # 交互模式：支持返回主界面
+    while True:
+        print("\n" + "=" * 60)
+        base_directory = select_directory()
+        validate_directory(base_directory)
+        process_directory(base_directory)
+
+        print()
+        again = input("返回主界面选择其他目录？(y/n): ").strip().lower()
+        if again not in ("y", "yes"):
+            print("退出程序。")
+            break
 
 
 if __name__ == "__main__":
